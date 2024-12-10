@@ -1,6 +1,6 @@
 - 👋 Hi, I’m @cggerling
 - 👀 I’m interested in Microsoft 365 & Azure
-- 🌱 I’m currently learning for my exam on SC-300
+- 🌱 I’m currently learning for my exam on SC-200
 - 💞️ I’m looking to collaborate on everthing about M365 & Azure
 - 📫 How to reach me, just write me a mail cg@chr-gerling.de
 
