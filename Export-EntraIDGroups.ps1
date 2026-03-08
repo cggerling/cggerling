@@ -36,7 +36,8 @@
 [CmdletBinding()]
 param(
     [string]$OutputPath = ".\EntraID_Groups_Export_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
-    [int]$BatchSize = 20
+    [int]$BatchSize = 20,
+    [string]$TenantId = ""
 )
 
 #region ── Hilfsfunktionen ───────────────────────────────────────────────────
@@ -119,7 +120,7 @@ function Get-GroupMembers {
         return ($memberStrings -join " | ")
     }
     catch {
-        Write-Log "Fehler beim Lesen der Member für Gruppe $GroupId: $_" -Level "WARN"
+        Write-Log "Fehler beim Lesen der Member für Gruppe ${GroupId}: $_" -Level "WARN"
         return "FEHLER"
     }
 }
@@ -173,7 +174,7 @@ function Get-PimSettings {
         return ($settingLines -join " || ")
     }
     catch {
-        Write-Log "Fehler beim Lesen der PIM-Settings für Gruppe $GroupId: $_" -Level "WARN"
+        Write-Log "Fehler beim Lesen der PIM-Settings für Gruppe ${GroupId}: $_" -Level "WARN"
         return ""
     }
 }
@@ -199,7 +200,7 @@ function Get-PimRoleAssignments {
         return ($lines -join " | ")
     }
     catch {
-        Write-Log "Fehler beim Lesen der PIM-Assignments für Gruppe $GroupId: $_" -Level "WARN"
+        Write-Log "Fehler beim Lesen der PIM-Assignments für Gruppe ${GroupId}: $_" -Level "WARN"
         return ""
     }
 }
@@ -225,7 +226,7 @@ function Get-PimEligibleMembers {
         return ($lines -join " | ")
     }
     catch {
-        Write-Log "Fehler beim Lesen der PIM-Eligible-Members für Gruppe $GroupId: $_" -Level "WARN"
+        Write-Log "Fehler beim Lesen der PIM-Eligible-Members für Gruppe ${GroupId}: $_" -Level "WARN"
         return ""
     }
 }
@@ -245,13 +246,21 @@ if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
 # ── Verbindung herstellen ─────────────────────────────────────────────────────
 Write-Log "Verbinde mit Microsoft Graph..."
 try {
-    Connect-MgGraph -Scopes @(
-        "Group.Read.All",
-        "GroupMember.Read.All",
-        "PrivilegedAccess.Read.AzureADGroup",
-        "RoleManagementPolicy.Read.AzureADGroup"
-    ) -ErrorAction Stop
+    $connectParams = @{
+        Scopes = @(
+            "Group.Read.All",
+            "GroupMember.Read.All",
+            "PrivilegedAccess.Read.AzureADGroup",
+            "RoleManagementPolicy.Read.AzureADGroup"
+        )
+        ErrorAction = "Stop"
+    }
+    if ($TenantId) { $connectParams.TenantId = $TenantId }
+    Connect-MgGraph @connectParams
+    $ctx = Get-MgContext
     Write-Log "Verbindung erfolgreich hergestellt." -Level "OK"
+    Write-Log "Angemeldeter Account : $($ctx.Account)" -Level "OK"
+    Write-Log "Tenant ID            : $($ctx.TenantId)" -Level "OK"
 }
 catch {
     Write-Log "Fehler beim Verbinden mit Microsoft Graph: $_" -Level "ERROR"
