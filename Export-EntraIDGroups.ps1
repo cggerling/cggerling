@@ -247,7 +247,7 @@ foreach ($group in $allGroups) {
 
     # ── Members und Owners laden ─────────────────────────────────────────────
     try {
-        $membersUri = "https://graph.microsoft.com/v1.0/groups/${groupId}/members?`$select=id,displayName,userPrincipalName,mail,@odata.type&`$top=999"
+        $membersUri = "https://graph.microsoft.com/v1.0/groups/${groupId}/members?`$select=id,displayName,userPrincipalName,mail&`$top=999"
         $members = Get-GraphPagedResults -Uri $membersUri
         foreach ($m in $members) {
             $objectType = ($m.'@odata.type' -replace '#microsoft\.graph\.', '')
@@ -268,7 +268,7 @@ foreach ($group in $allGroups) {
     }
 
     try {
-        $ownersUri = "https://graph.microsoft.com/v1.0/groups/${groupId}/owners?`$select=id,displayName,userPrincipalName,mail,@odata.type&`$top=999"
+        $ownersUri = "https://graph.microsoft.com/v1.0/groups/${groupId}/owners?`$select=id,displayName,userPrincipalName,mail&`$top=999"
         $owners = Get-GraphPagedResults -Uri $ownersUri
         foreach ($o in $owners) {
             $objectType = ($o.'@odata.type' -replace '#microsoft\.graph\.', '')
