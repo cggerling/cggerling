@@ -1,42 +1,52 @@
 <#
 .SYNOPSIS
-    Exportiert alle Entra ID Gruppen inkl. Members und PIM-for-Groups-Informationen in eine CSV-Datei.
+    Exportiert alle Entra ID Gruppen mit Properties, Mitgliedschaften, PIM-Einstellungen
+    und Access-Review-Informationen in mehrere CSV-Dateien.
 
 .DESCRIPTION
-    Das Script verbindet sich mit Microsoft Graph und liest alle Gruppen aus der Entra ID aus.
-    Pro Gruppe werden folgende Werte ermittelt:
-      - Gruppenname
-      - Typ (Security, Microsoft 365, Distribution, Mail-enabled Security)
-      - Members (DisplayName | UPN)
-      - PIM for Groups aktiviert (Ja/Nein)
-      - PIM-Einstellungen (Policy)
-      - PIM Role Assignments (aktive Zuweisungen)
-      - PIM Eligible Members (berechtigte Mitglieder)
+    Das Script verbindet sich mit Microsoft Graph (Least Privilege / Zero Trust) und erstellt:
 
-.PARAMETER OutputPath
-    Pfad zur Ausgabe-CSV-Datei. Standard: .\EntraID_Groups_Export_<Datum>.csv
+    1. Gruppen_Uebersicht.csv  - Alle Gruppen mit Properties
+    2. Gruppen_Mitglieder.csv  - Mitgliedschaften (Members + Owners) pro Gruppe
+    3. PIM_Einstellungen.csv   - Detaillierte PIM-Settings fuer aktivierte Gruppen
+    4. PIM_Zuweisungen.csv     - Aktive und berechtigte PIM-Zuweisungen
 
-.PARAMETER BatchSize
-    Anzahl der Gruppen, die parallel verarbeitet werden (Standard: 20).
+    Exportierte Gruppen-Properties:
+      - Group Name, Description, Group Type, Membership Type
+      - Rollenzuweisung moeglich (isAssignableToRole)
+      - PIM aktiviert (Ja/Nein)
+
+    PIM-Details (nur fuer PIM-aktivierte Gruppen):
+      - Activation Settings (Max Duration, MFA, Justification, Ticketing, Approval, Approvers)
+      - Assignment Settings (Permanent Eligible/Active, Expiration, MFA, Justification)
+      - Active Assignments, Eligible Assignments
+      - Access Review Konfiguration
+
+.PARAMETER OutputFolder
+    Ordner fuer die Export-Dateien. Standard: .\EntraID_Export_<Datum>
+
+.PARAMETER TenantId
+    Optionale Tenant-ID fuer Multi-Tenant-Umgebungen.
 
 .EXAMPLE
     .\Export-EntraIDGroups.ps1
-    .\Export-EntraIDGroups.ps1 -OutputPath "C:\Reports\groups.csv"
+    .\Export-EntraIDGroups.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    .\Export-EntraIDGroups.ps1 -OutputFolder "C:\Reports\EntraExport"
 
 .NOTES
-    Benötigte Microsoft Graph Berechtigungen (Application oder Delegated):
-      - Group.Read.All
-      - GroupMember.Read.All
-      - PrivilegedAccess.Read.AzureADGroup
-      - RoleManagementPolicy.Read.AzureADGroup
+    Berechtigungen (Least Privilege / Zero Trust):
+      - Group.Read.All                                    (Gruppen + Members + Owners lesen)
+      - PrivilegedEligibilitySchedule.Read.AzureADGroup   (PIM Eligible Schedules)
+      - PrivilegedAssignmentSchedule.Read.AzureADGroup    (PIM Assignment Schedules)
+      - RoleManagementPolicy.Read.AzureADGroup            (PIM Policy Rules)
+      - AccessReview.Read.All                             (Access Reviews)
 
     Voraussetzung: Microsoft.Graph PowerShell SDK (Install-Module Microsoft.Graph)
 #>
 
 [CmdletBinding()]
 param(
-    [string]$OutputPath = ".\EntraID_Groups_Export_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
-    [int]$BatchSize = 20,
+    [string]$OutputFolder = ".\EntraID_Export_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
     [string]$TenantId = ""
 )
 
@@ -55,9 +65,6 @@ function Write-Log {
 }
 
 function Get-GraphPagedResults {
-    <#
-    .SYNOPSIS Liest alle Seiten einer paginierten Graph-Antwort aus.
-    #>
     param([string]$Uri)
     $results = @()
     $nextLink = $Uri
@@ -75,160 +82,49 @@ function Get-GraphPagedResults {
     return $results
 }
 
-function Get-GroupType {
-    <#
-    .SYNOPSIS Ermittelt den lesbaren Gruppentyp anhand der Graph-Eigenschaften.
-    #>
+function Get-GroupTypeName {
     param($Group)
-    $gt = $Group.groupTypes
-    $mailEnabled  = $Group.mailEnabled
-    $secEnabled   = $Group.securityEnabled
+    $gt          = $Group.groupTypes
+    $mailEnabled = $Group.mailEnabled
+    $secEnabled  = $Group.securityEnabled
 
-    if ($gt -contains "Unified") {
-        return "Microsoft 365"
-    }
-    elseif ($secEnabled -and $mailEnabled) {
-        return "Mail-enabled Security"
-    }
-    elseif ($secEnabled -and -not $mailEnabled) {
-        return "Security"
-    }
-    elseif ($mailEnabled -and -not $secEnabled) {
-        return "Distribution"
-    }
-    else {
-        return "Unbekannt"
-    }
+    if ($gt -contains "Unified")                       { return "Microsoft 365" }
+    elseif ($secEnabled -and $mailEnabled)             { return "Mail-enabled Security" }
+    elseif ($secEnabled -and -not $mailEnabled)        { return "Security" }
+    elseif ($mailEnabled -and -not $secEnabled)        { return "Distribution" }
+    else                                               { return "Unbekannt" }
 }
 
-function Get-GroupMembers {
-    <#
-    .SYNOPSIS Liest alle direkten Member einer Gruppe und gibt sie als String zurück.
-    #>
-    param([string]$GroupId)
-    try {
-        $uri     = "https://graph.microsoft.com/v1.0/groups/$GroupId/members?`$select=displayName,userPrincipalName,mail,id&`$top=999"
-        $members = Get-GraphPagedResults -Uri $uri
-        if (-not $members) { return "" }
-
-        $memberStrings = foreach ($m in $members) {
-            $upn = if ($m.userPrincipalName) { $m.userPrincipalName }
-                   elseif ($m.mail)          { $m.mail }
-                   else                      { $m.id }
-            "$($m.displayName) ($upn)"
-        }
-        return ($memberStrings -join " | ")
-    }
-    catch {
-        Write-Log "Fehler beim Lesen der Member für Gruppe ${GroupId}: $_" -Level "WARN"
-        return "FEHLER"
-    }
+function Get-MembershipTypeName {
+    param($Group)
+    if ($Group.groupTypes -contains "DynamicMembership") { return "Dynamisch" }
+    else                                                 { return "Zugewiesen" }
 }
 
-function Get-PimStatus {
-    <#
-    .SYNOPSIS
-        Prüft ob PIM for Groups für eine Gruppe aktiv ist.
-        Eine Gruppe gilt als PIM-fähig, wenn mindestens ein aktives oder berechtigtes
-        Assignment-Schedule vorhanden ist ODER eine RoleManagementPolicy existiert.
-    #>
-    param([string]$GroupId)
-    try {
-        # Prüfe auf Eligible Schedules
-        $eligUri = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$filter=groupId eq '$GroupId'&`$top=1"
-        $eligResp = Invoke-MgGraphRequest -Uri $eligUri -Method GET -ErrorAction Stop
-        if ($eligResp.value -and $eligResp.value.Count -gt 0) { return $true }
-
-        # Prüfe auf Active Assignment Schedules
-        $assignUri = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentSchedules?`$filter=groupId eq '$GroupId'&`$top=1"
-        $assignResp = Invoke-MgGraphRequest -Uri $assignUri -Method GET -ErrorAction Stop
-        if ($assignResp.value -and $assignResp.value.Count -gt 0) { return $true }
-
-        return $false
+function ConvertFrom-IsoDuration {
+    param([string]$Duration)
+    if (-not $Duration) { return "" }
+    if ($Duration -match '^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$') {
+        $parts = @()
+        if ($Matches[1]) { $parts += "$($Matches[1]) Jahre" }
+        if ($Matches[2]) { $parts += "$($Matches[2]) Monate" }
+        if ($Matches[3]) { $parts += "$($Matches[3]) Tage" }
+        if ($Matches[4]) { $parts += "$($Matches[4]) Stunden" }
+        if ($Matches[5]) { $parts += "$($Matches[5]) Minuten" }
+        if ($Matches[6]) { $parts += "$($Matches[6]) Sekunden" }
+        if ($parts.Count -gt 0) { return ($parts -join " ") }
     }
-    catch {
-        # 403 oder 404 = keine PIM-Konfiguration für diese Gruppe
-        return $false
-    }
+    return $Duration
 }
 
-function Get-PimSettings {
-    <#
-    .SYNOPSIS Liest die RoleManagementPolicy-Einstellungen für eine PIM-Gruppe.
-    #>
-    param([string]$GroupId)
-    try {
-        $uri      = "https://graph.microsoft.com/v1.0/policies/roleManagementPolicies?`$filter=scopeId eq '$GroupId' and scopeType eq 'Group'"
-        $policies = Get-GraphPagedResults -Uri $uri
-        if (-not $policies) { return "" }
-
-        $settingLines = foreach ($policy in $policies) {
-            $rulesSummary = @()
-            if ($policy.rules) {
-                foreach ($rule in $policy.rules) {
-                    $rulesSummary += "$($rule.'@odata.type' -replace '#microsoft.graph.',''): ID=$($rule.id)"
-                }
-            }
-            "Policy: $($policy.displayName) | Scope: $($policy.scopeType) | Rules: $($rulesSummary -join ', ')"
-        }
-        return ($settingLines -join " || ")
-    }
-    catch {
-        Write-Log "Fehler beim Lesen der PIM-Settings für Gruppe ${GroupId}: $_" -Level "WARN"
-        return ""
-    }
-}
-
-function Get-PimRoleAssignments {
-    <#
-    .SYNOPSIS Liest aktive PIM-Rollenzuweisungen (assignmentSchedules) für eine Gruppe.
-    #>
-    param([string]$GroupId)
-    try {
-        $uri         = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentSchedules?`$filter=groupId eq '$GroupId'&`$expand=principal"
-        $assignments = Get-GraphPagedResults -Uri $uri
-        if (-not $assignments) { return "" }
-
-        $lines = foreach ($a in $assignments) {
-            $principal  = if ($a.principal.displayName) { $a.principal.displayName } else { $a.principalId }
-            $role       = $a.accessId   # 'member' oder 'owner'
-            $status     = $a.status
-            $schedType  = if ($a.scheduleInfo.expiration.type) { $a.scheduleInfo.expiration.type } else { "permanent" }
-            $expiry     = if ($a.scheduleInfo.expiration.endDateTime) { $a.scheduleInfo.expiration.endDateTime } else { "-" }
-            "$principal | Rolle: $role | Status: $status | Ablauf: $schedType ($expiry)"
-        }
-        return ($lines -join " | ")
-    }
-    catch {
-        Write-Log "Fehler beim Lesen der PIM-Assignments für Gruppe ${GroupId}: $_" -Level "WARN"
-        return ""
-    }
-}
-
-function Get-PimEligibleMembers {
-    <#
-    .SYNOPSIS Liest eligible (berechtigte) PIM-Mitglieder einer Gruppe.
-    #>
-    param([string]$GroupId)
-    try {
-        $uri      = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$filter=groupId eq '$GroupId'&`$expand=principal"
-        $eligible = Get-GraphPagedResults -Uri $uri
-        if (-not $eligible) { return "" }
-
-        $lines = foreach ($e in $eligible) {
-            $principal  = if ($e.principal.displayName) { $e.principal.displayName } else { $e.principalId }
-            $role       = $e.accessId
-            $status     = $e.status
-            $schedType  = if ($e.scheduleInfo.expiration.type) { $e.scheduleInfo.expiration.type } else { "permanent" }
-            $expiry     = if ($e.scheduleInfo.expiration.endDateTime) { $e.scheduleInfo.expiration.endDateTime } else { "-" }
-            "$principal | Rolle: $role | Status: $status | Ablauf: $schedType ($expiry)"
-        }
-        return ($lines -join " | ")
-    }
-    catch {
-        Write-Log "Fehler beim Lesen der PIM-Eligible-Members für Gruppe ${GroupId}: $_" -Level "WARN"
-        return ""
-    }
+function Export-CsvUtf8Bom {
+    param(
+        [Parameter(Mandatory)]$Data,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $csv = ($Data | ConvertTo-Csv -NoTypeInformation -Delimiter ";")
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllLines($Path, $csv, $utf8Bom)
 }
 
 #endregion
@@ -237,98 +133,396 @@ function Get-PimEligibleMembers {
 
 Write-Log "=== Entra ID Gruppen Export gestartet ===" -Level "OK"
 
-# ── Modul prüfen ──────────────────────────────────────────────────────────────
+# ── Modul pruefen ────────────────────────────────────────────────────────────
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
     Write-Log "Microsoft.Graph Modul nicht gefunden. Bitte installieren mit: Install-Module Microsoft.Graph" -Level "ERROR"
     exit 1
 }
 
-# ── Verbindung herstellen ─────────────────────────────────────────────────────
-Write-Log "Verbinde mit Microsoft Graph..."
+# ── Ausgabeordner erstellen ──────────────────────────────────────────────────
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+$OutputFolder = (Resolve-Path $OutputFolder).Path
+Write-Log "Ausgabeordner: $OutputFolder"
+
+# ── Verbindung herstellen (Least Privilege) ──────────────────────────────────
+Write-Log "Verbinde mit Microsoft Graph (Least Privilege Scopes)..."
 try {
     $connectParams = @{
         Scopes = @(
             "Group.Read.All",
-            "GroupMember.Read.All",
-            "PrivilegedAccess.Read.AzureADGroup",
-            "RoleManagementPolicy.Read.AzureADGroup"
+            "PrivilegedEligibilitySchedule.Read.AzureADGroup",
+            "PrivilegedAssignmentSchedule.Read.AzureADGroup",
+            "RoleManagementPolicy.Read.AzureADGroup",
+            "AccessReview.Read.All"
         )
         ErrorAction = "Stop"
     }
     if ($TenantId) { $connectParams.TenantId = $TenantId }
     Connect-MgGraph @connectParams
+
     $ctx = Get-MgContext
     Write-Log "Verbindung erfolgreich hergestellt." -Level "OK"
-    Write-Log "Angemeldeter Account : $($ctx.Account)" -Level "OK"
-    Write-Log "Tenant ID            : $($ctx.TenantId)" -Level "OK"
+    Write-Log "Account  : $($ctx.Account)" -Level "OK"
+    Write-Log "Tenant ID: $($ctx.TenantId)" -Level "OK"
 }
 catch {
     Write-Log "Fehler beim Verbinden mit Microsoft Graph: $_" -Level "ERROR"
     exit 1
 }
 
-# ── Alle Gruppen laden ────────────────────────────────────────────────────────
+# ── Alle Gruppen laden ──────────────────────────────────────────────────────
 Write-Log "Lade alle Gruppen aus Entra ID..."
-$groupUri  = "https://graph.microsoft.com/v1.0/groups?`$select=id,displayName,groupTypes,mailEnabled,securityEnabled,description&`$top=999"
+$groupUri  = "https://graph.microsoft.com/v1.0/groups?`$select=id,displayName,description,groupTypes,mailEnabled,securityEnabled,isAssignableToRole,membershipRuleProcessingState&`$top=999"
 $allGroups = Get-GraphPagedResults -Uri $groupUri
 Write-Log "$($allGroups.Count) Gruppen gefunden." -Level "OK"
 
-# ── Verarbeitung ──────────────────────────────────────────────────────────────
-$exportData  = [System.Collections.Generic.List[PSCustomObject]]::new()
+# ── Access Review Definitionen vorladen ──────────────────────────────────────
+Write-Log "Lade Access Review Definitionen..."
+$accessReviewDefs = @()
+try {
+    $arUri = "https://graph.microsoft.com/v1.0/identityGovernance/accessReviews/definitions?`$select=id,displayName,scope,instanceEnumerationScope,status"
+    $accessReviewDefs = Get-GraphPagedResults -Uri $arUri
+    Write-Log "$($accessReviewDefs.Count) Access Review Definitionen geladen." -Level "OK"
+}
+catch {
+    Write-Log "Access Reviews konnten nicht geladen werden (fehlende Berechtigung?): $_" -Level "WARN"
+}
+
+# ── Daten-Listen initialisieren ──────────────────────────────────────────────
+$groupOverview    = [System.Collections.Generic.List[PSCustomObject]]::new()
+$memberData       = [System.Collections.Generic.List[PSCustomObject]]::new()
+$pimSettingsData  = [System.Collections.Generic.List[PSCustomObject]]::new()
+$pimAssignData    = [System.Collections.Generic.List[PSCustomObject]]::new()
+
 $totalGroups = $allGroups.Count
 $counter     = 0
 
+# ── Gruppen verarbeiten ─────────────────────────────────────────────────────
 foreach ($group in $allGroups) {
     $counter++
     $pct = [math]::Round(($counter / $totalGroups) * 100)
-    Write-Progress -Activity "Verarbeite Gruppen" -Status "$counter/$totalGroups – $($group.displayName)" -PercentComplete $pct
+    Write-Progress -Activity "Verarbeite Gruppen" -Status "$counter/$totalGroups - $($group.displayName)" -PercentComplete $pct
+    Write-Log "[$counter/$totalGroups] $($group.displayName)"
 
-    Write-Log "[$counter/$totalGroups] Verarbeite: $($group.displayName)"
-
-    # Grunddaten
+    $groupId   = $group.id
     $groupName = $group.displayName
-    $groupType = Get-GroupType -Group $group
-    $members   = Get-GroupMembers -GroupId $group.id
+    $groupType = Get-GroupTypeName -Group $group
+    $membershipType = Get-MembershipTypeName -Group $group
+    $rolesAssignable = if ($group.isAssignableToRole) { "Ja" } else { "Nein" }
 
-    # PIM
-    $pimEnabled      = Get-PimStatus       -GroupId $group.id
-    $pimSettings     = ""
-    $pimAssignments  = ""
-    $pimEligible     = ""
+    # ── PIM-Status pruefen ───────────────────────────────────────────────────
+    $pimEnabled = $false
+    try {
+        $eligUri  = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$filter=groupId eq '${groupId}'&`$top=1"
+        $eligResp = Invoke-MgGraphRequest -Uri $eligUri -Method GET -ErrorAction Stop
+        if ($eligResp.value -and $eligResp.value.Count -gt 0) { $pimEnabled = $true }
 
-    if ($pimEnabled) {
-        Write-Log "  -> PIM for Groups ist aktiv. Lese PIM-Details..." -Level "OK"
-        $pimSettings    = Get-PimSettings        -GroupId $group.id
-        $pimAssignments = Get-PimRoleAssignments  -GroupId $group.id
-        $pimEligible    = Get-PimEligibleMembers  -GroupId $group.id
+        if (-not $pimEnabled) {
+            $assignUri  = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentSchedules?`$filter=groupId eq '${groupId}'&`$top=1"
+            $assignResp = Invoke-MgGraphRequest -Uri $assignUri -Method GET -ErrorAction Stop
+            if ($assignResp.value -and $assignResp.value.Count -gt 0) { $pimEnabled = $true }
+        }
+
+        if (-not $pimEnabled) {
+            $policyCheckUri = "https://graph.microsoft.com/v1.0/policies/roleManagementPolicyAssignments?`$filter=scopeId eq '${groupId}' and scopeType eq 'Group'&`$top=1"
+            $policyResp = Invoke-MgGraphRequest -Uri $policyCheckUri -Method GET -ErrorAction Stop
+            if ($policyResp.value -and $policyResp.value.Count -gt 0) { $pimEnabled = $true }
+        }
+    }
+    catch {
+        # 403/404 = keine PIM-Konfiguration
     }
 
-    $exportData.Add([PSCustomObject]@{
-        Gruppenname             = $groupName
-        Typ                     = $groupType
-        Beschreibung            = $group.description
-        Member                  = $members
-        PIM_aktiviert           = if ($pimEnabled) { "Ja" } else { "Nein" }
-        PIM_Einstellungen       = $pimSettings
-        PIM_Rollenzuweisungen   = $pimAssignments
-        PIM_Eligible_Members    = $pimEligible
+    # ── Gruppen-Uebersicht ───────────────────────────────────────────────────
+    $groupOverview.Add([PSCustomObject]@{
+        Gruppenname              = $groupName
+        Beschreibung             = $group.description
+        Gruppentyp               = $groupType
+        Mitgliedschaftstyp       = $membershipType
+        Rollenzuweisung_moeglich = $rolesAssignable
+        PIM_aktiviert            = if ($pimEnabled) { "Ja" } else { "Nein" }
     })
+
+    # ── Members und Owners laden ─────────────────────────────────────────────
+    try {
+        $membersUri = "https://graph.microsoft.com/v1.0/groups/${groupId}/members?`$select=id,displayName,userPrincipalName,mail,@odata.type&`$top=999"
+        $members = Get-GraphPagedResults -Uri $membersUri
+        foreach ($m in $members) {
+            $objectType = ($m.'@odata.type' -replace '#microsoft\.graph\.', '')
+            $upn = if ($m.userPrincipalName) { $m.userPrincipalName }
+                   elseif ($m.mail)          { $m.mail }
+                   else                      { $m.id }
+            $memberData.Add([PSCustomObject]@{
+                Gruppenname   = $groupName
+                Anzeigename   = $m.displayName
+                UPN           = $upn
+                Objekttyp     = $objectType
+                Rolle         = "Member"
+            })
+        }
+    }
+    catch {
+        Write-Log "  Fehler beim Lesen der Members fuer ${groupName}: $_" -Level "WARN"
+    }
+
+    try {
+        $ownersUri = "https://graph.microsoft.com/v1.0/groups/${groupId}/owners?`$select=id,displayName,userPrincipalName,mail,@odata.type&`$top=999"
+        $owners = Get-GraphPagedResults -Uri $ownersUri
+        foreach ($o in $owners) {
+            $objectType = ($o.'@odata.type' -replace '#microsoft\.graph\.', '')
+            $upn = if ($o.userPrincipalName) { $o.userPrincipalName }
+                   elseif ($o.mail)          { $o.mail }
+                   else                      { $o.id }
+            $memberData.Add([PSCustomObject]@{
+                Gruppenname   = $groupName
+                Anzeigename   = $o.displayName
+                UPN           = $upn
+                Objekttyp     = $objectType
+                Rolle         = "Besitzer"
+            })
+        }
+    }
+    catch {
+        Write-Log "  Fehler beim Lesen der Owners fuer ${groupName}: $_" -Level "WARN"
+    }
+
+    # ── PIM-Details (nur fuer PIM-aktivierte Gruppen) ────────────────────────
+    if ($pimEnabled) {
+        Write-Log "  -> PIM aktiv. Lese Details..." -Level "OK"
+
+        # ── Policy Assignments + Rules laden ─────────────────────────────────
+        try {
+            $paUri = "https://graph.microsoft.com/v1.0/policies/roleManagementPolicyAssignments?`$filter=scopeId eq '${groupId}' and scopeType eq 'Group'"
+            $policyAssignments = Get-GraphPagedResults -Uri $paUri
+
+            foreach ($pa in $policyAssignments) {
+                $roleDefinition = $pa.roleDefinitionId  # "member" oder "owner"
+                $policyId       = $pa.policyId
+
+                # Policy mit Rules laden
+                $policyUri = "https://graph.microsoft.com/v1.0/policies/roleManagementPolicies/${policyId}?`$expand=rules"
+                $policy    = Invoke-MgGraphRequest -Uri $policyUri -Method GET -ErrorAction Stop
+                $rules     = $policy.rules
+
+                # Defaults
+                $activationMaxDuration         = ""
+                $activationMfa                 = "Nein"
+                $activationJustification       = "Nein"
+                $activationTicketing           = "Nein"
+                $activationApprovalRequired    = "Nein"
+                $activationApprovers           = ""
+                $permanentEligibleAllowed      = "Nein"
+                $eligibleExpirationAfter       = ""
+                $permanentActiveAllowed        = "Nein"
+                $activeExpirationAfter         = ""
+                $activeAssignmentMfa           = "Nein"
+                $activeAssignmentJustification = "Nein"
+
+                foreach ($rule in $rules) {
+                    switch ($rule.id) {
+                        "Expiration_EndUser_Assignment" {
+                            $activationMaxDuration = ConvertFrom-IsoDuration -Duration $rule.maximumDuration
+                        }
+                        "Enablement_EndUser_Assignment" {
+                            $enabled = $rule.enabledRules
+                            if ($enabled -contains "MultiFactorAuthentication") { $activationMfa = "Ja" }
+                            if ($enabled -contains "Justification")             { $activationJustification = "Ja" }
+                            if ($enabled -contains "Ticketing")                 { $activationTicketing = "Ja" }
+                        }
+                        "Approval_EndUser_Assignment" {
+                            if ($rule.setting.isApprovalRequired) {
+                                $activationApprovalRequired = "Ja"
+                                $approverList = @()
+                                foreach ($stage in $rule.setting.approvalStages) {
+                                    foreach ($approver in $stage.primaryApprovers) {
+                                        $approverName = if ($approver.description) { $approver.description }
+                                                        elseif ($approver.userId)  { $approver.userId }
+                                                        elseif ($approver.groupId) { $approver.groupId }
+                                                        else                       { "Unbekannt" }
+                                        $approverList += $approverName
+                                    }
+                                }
+                                $activationApprovers = $approverList -join ", "
+                            }
+                        }
+                        "Expiration_Admin_Eligibility" {
+                            if (-not $rule.isExpirationRequired) {
+                                $permanentEligibleAllowed = "Ja"
+                            }
+                            $eligibleExpirationAfter = ConvertFrom-IsoDuration -Duration $rule.maximumDuration
+                        }
+                        "Expiration_Admin_Assignment" {
+                            if (-not $rule.isExpirationRequired) {
+                                $permanentActiveAllowed = "Ja"
+                            }
+                            $activeExpirationAfter = ConvertFrom-IsoDuration -Duration $rule.maximumDuration
+                        }
+                        "Enablement_Admin_Assignment" {
+                            $enabled = $rule.enabledRules
+                            if ($enabled -contains "MultiFactorAuthentication") { $activeAssignmentMfa = "Ja" }
+                            if ($enabled -contains "Justification")             { $activeAssignmentJustification = "Ja" }
+                        }
+                    }
+                }
+
+                # Access Review fuer diese Gruppe pruefen
+                $arConfigured = "Nein"
+                $arName       = ""
+                foreach ($arDef in $accessReviewDefs) {
+                    $scopeQuery = ""
+                    if ($arDef.scope -and $arDef.scope.query) {
+                        $scopeQuery = $arDef.scope.query
+                    }
+                    $enumQuery = ""
+                    if ($arDef.instanceEnumerationScope -and $arDef.instanceEnumerationScope.query) {
+                        $enumQuery = $arDef.instanceEnumerationScope.query
+                    }
+                    if ($scopeQuery -like "*${groupId}*" -or $enumQuery -like "*${groupId}*") {
+                        $arConfigured = "Ja"
+                        $arName = $arDef.displayName
+                        break
+                    }
+                }
+
+                $pimSettingsData.Add([PSCustomObject]@{
+                    Gruppenname                              = $groupName
+                    Rolle                                    = $roleDefinition
+                    Aktivierung_Max_Dauer                    = $activationMaxDuration
+                    Aktivierung_MFA_erforderlich              = $activationMfa
+                    Aktivierung_Begruendung_erforderlich      = $activationJustification
+                    Aktivierung_Ticketinfo_erforderlich       = $activationTicketing
+                    Aktivierung_Genehmigung_erforderlich      = $activationApprovalRequired
+                    Aktivierung_Genehmiger                   = $activationApprovers
+                    Zuweisung_Permanent_Berechtigt_erlaubt   = $permanentEligibleAllowed
+                    Zuweisung_Berechtigt_Ablauf_nach         = $eligibleExpirationAfter
+                    Zuweisung_Permanent_Aktiv_erlaubt        = $permanentActiveAllowed
+                    Zuweisung_Aktiv_Ablauf_nach              = $activeExpirationAfter
+                    Zuweisung_Aktiv_MFA_erforderlich          = $activeAssignmentMfa
+                    Zuweisung_Aktiv_Begruendung_erforderlich  = $activeAssignmentJustification
+                    AccessReview_konfiguriert                = $arConfigured
+                    AccessReview_Name                        = $arName
+                })
+            }
+        }
+        catch {
+            Write-Log "  Fehler beim Lesen der PIM-Policies fuer ${groupName}: $_" -Level "WARN"
+        }
+
+        # ── Active Assignments ───────────────────────────────────────────────
+        try {
+            $activeUri   = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentSchedules?`$filter=groupId eq '${groupId}'"
+            $activeAssignments = Get-GraphPagedResults -Uri $activeUri
+            foreach ($a in $activeAssignments) {
+                $principalName = $a.principalId
+                try {
+                    $principalObj  = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/directoryObjects/$($a.principalId)?`$select=displayName,userPrincipalName" -Method GET -ErrorAction Stop
+                    $principalName = $principalObj.displayName
+                    $principalUpn  = $principalObj.userPrincipalName
+                }
+                catch { $principalUpn = "" }
+
+                $schedType = if ($a.scheduleInfo.expiration.type) { $a.scheduleInfo.expiration.type } else { "noExpiration" }
+                $endDate   = if ($a.scheduleInfo.expiration.endDateTime) { $a.scheduleInfo.expiration.endDateTime } else { "-" }
+                $startDate = if ($a.scheduleInfo.startDateTime) { $a.scheduleInfo.startDateTime } else { "-" }
+
+                $pimAssignData.Add([PSCustomObject]@{
+                    Gruppenname      = $groupName
+                    Zuweisungstyp    = "Aktiv"
+                    Anzeigename      = $principalName
+                    UPN              = $principalUpn
+                    Rolle            = $a.accessId
+                    Status           = $a.status
+                    Startdatum       = $startDate
+                    Enddatum         = $endDate
+                    Ablauftyp        = $schedType
+                })
+            }
+        }
+        catch {
+            Write-Log "  Fehler beim Lesen der aktiven PIM-Zuweisungen fuer ${groupName}: $_" -Level "WARN"
+        }
+
+        # ── Eligible Assignments ─────────────────────────────────────────────
+        try {
+            $eligibleUri   = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$filter=groupId eq '${groupId}'"
+            $eligibleAssignments = Get-GraphPagedResults -Uri $eligibleUri
+            foreach ($e in $eligibleAssignments) {
+                $principalName = $e.principalId
+                try {
+                    $principalObj  = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/directoryObjects/$($e.principalId)?`$select=displayName,userPrincipalName" -Method GET -ErrorAction Stop
+                    $principalName = $principalObj.displayName
+                    $principalUpn  = $principalObj.userPrincipalName
+                }
+                catch { $principalUpn = "" }
+
+                $schedType = if ($e.scheduleInfo.expiration.type) { $e.scheduleInfo.expiration.type } else { "noExpiration" }
+                $endDate   = if ($e.scheduleInfo.expiration.endDateTime) { $e.scheduleInfo.expiration.endDateTime } else { "-" }
+                $startDate = if ($e.scheduleInfo.startDateTime) { $e.scheduleInfo.startDateTime } else { "-" }
+
+                $pimAssignData.Add([PSCustomObject]@{
+                    Gruppenname      = $groupName
+                    Zuweisungstyp    = "Berechtigt"
+                    Anzeigename      = $principalName
+                    UPN              = $principalUpn
+                    Rolle            = $e.accessId
+                    Status           = $e.status
+                    Startdatum       = $startDate
+                    Enddatum         = $endDate
+                    Ablauftyp        = $schedType
+                })
+            }
+        }
+        catch {
+            Write-Log "  Fehler beim Lesen der berechtigten PIM-Zuweisungen fuer ${groupName}: $_" -Level "WARN"
+        }
+    }
 }
 
 Write-Progress -Activity "Verarbeite Gruppen" -Completed
 
-# ── CSV-Export ────────────────────────────────────────────────────────────────
-Write-Log "Exportiere Daten nach: $OutputPath"
+# ── CSV-Export (UTF-8 mit BOM fuer korrekte Sonderzeichen) ───────────────────
+Write-Log "Exportiere CSV-Dateien..."
+
+$fileGroups  = Join-Path $OutputFolder "Gruppen_Uebersicht.csv"
+$fileMembers = Join-Path $OutputFolder "Gruppen_Mitglieder.csv"
+$filePimSet  = Join-Path $OutputFolder "PIM_Einstellungen.csv"
+$filePimAss  = Join-Path $OutputFolder "PIM_Zuweisungen.csv"
+
 try {
-    $exportData | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8 -Delimiter ";" -ErrorAction Stop
-    Write-Log "Export erfolgreich abgeschlossen! Datei: $OutputPath" -Level "OK"
-    Write-Log "Gesamt: $($exportData.Count) Gruppen exportiert." -Level "OK"
+    if ($groupOverview.Count -gt 0) {
+        Export-CsvUtf8Bom -Data $groupOverview -Path $fileGroups
+        Write-Log "  $fileGroups ($($groupOverview.Count) Gruppen)" -Level "OK"
+    }
+    if ($memberData.Count -gt 0) {
+        Export-CsvUtf8Bom -Data $memberData -Path $fileMembers
+        Write-Log "  $fileMembers ($($memberData.Count) Eintraege)" -Level "OK"
+    }
+    if ($pimSettingsData.Count -gt 0) {
+        Export-CsvUtf8Bom -Data $pimSettingsData -Path $filePimSet
+        Write-Log "  $filePimSet ($($pimSettingsData.Count) Eintraege)" -Level "OK"
+    }
+    if ($pimAssignData.Count -gt 0) {
+        Export-CsvUtf8Bom -Data $pimAssignData -Path $filePimAss
+        Write-Log "  $filePimAss ($($pimAssignData.Count) Eintraege)" -Level "OK"
+    }
+    Write-Log "Export abgeschlossen!" -Level "OK"
 }
 catch {
-    Write-Log "Fehler beim Schreiben der CSV-Datei: $_" -Level "ERROR"
+    Write-Log "Fehler beim Schreiben der CSV-Dateien: $_" -Level "ERROR"
 }
 
-# ── Verbindung trennen ────────────────────────────────────────────────────────
+# ── Zusammenfassung ──────────────────────────────────────────────────────────
+$pimGroupCount = ($groupOverview | Where-Object { $_.PIM_aktiviert -eq "Ja" }).Count
+Write-Log "=== Zusammenfassung ===" -Level "OK"
+Write-Log "  Gruppen gesamt     : $($groupOverview.Count)" -Level "OK"
+Write-Log "  PIM-aktiviert      : $pimGroupCount" -Level "OK"
+Write-Log "  Mitgliedschaften   : $($memberData.Count)" -Level "OK"
+Write-Log "  PIM-Zuweisungen    : $($pimAssignData.Count)" -Level "OK"
+Write-Log "  Ausgabeordner      : $OutputFolder" -Level "OK"
+
+# ── Verbindung trennen ──────────────────────────────────────────────────────
 Disconnect-MgGraph | Out-Null
 Write-Log "Verbindung getrennt. Script beendet." -Level "OK"
 
