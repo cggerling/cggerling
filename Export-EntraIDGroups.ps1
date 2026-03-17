@@ -1,26 +1,27 @@
 <#
 .SYNOPSIS
-    Exportiert alle Entra ID Gruppen mit Properties, Mitgliedschaften, PIM-Einstellungen
-    und Access-Review-Informationen in mehrere CSV-Dateien.
+    Exportiert alle Entra ID Gruppen, Benutzer und Admin-Rollenzuweisungen in CSV-Dateien.
 
 .DESCRIPTION
     Das Script verbindet sich mit Microsoft Graph (Least Privilege / Zero Trust) und erstellt:
 
-    1. Gruppen_Uebersicht.csv  - Alle Gruppen mit Properties
-    2. Gruppen_Mitglieder.csv  - Mitgliedschaften (Members + Owners) pro Gruppe
-    3. PIM_Einstellungen.csv   - Detaillierte PIM-Settings fuer aktivierte Gruppen
-    4. PIM_Zuweisungen.csv     - Aktive und berechtigte PIM-Zuweisungen
+    1. Gruppen_Uebersicht.csv     - Alle Gruppen mit Properties
+    2. Gruppen_Mitglieder.csv     - Mitgliedschaften (Members + Owners) pro Gruppe
+    3. PIM_Einstellungen.csv      - Detaillierte PIM-Settings fuer aktivierte Gruppen
+    4. PIM_Zuweisungen.csv        - Aktive und berechtigte PIM-Zuweisungen (Gruppen)
+    5. Benutzer.csv               - Alle Benutzerobjekte mit Account-Details
+    6. Rollen_Aktiv.csv           - Alle aktiven Directory-Rollenzuweisungen (statisch + PIM)
+    7. Rollen_Eligible.csv        - Alle berechtigten (eligible) Directory-Rollenzuweisungen
 
-    Exportierte Gruppen-Properties:
-      - Group Name, Description, Group Type, Membership Type
-      - Rollenzuweisung moeglich (isAssignableToRole)
-      - PIM aktiviert (Ja/Nein)
+    Gruppen-Properties:
+      - Name, Description, Type, Membership Type, Rollenzuweisung moeglich, PIM aktiviert
 
-    PIM-Details (nur fuer PIM-aktivierte Gruppen):
-      - Activation Settings (Max Duration, MFA, Justification, Ticketing, Approval, Approvers)
-      - Assignment Settings (Permanent Eligible/Active, Expiration, MFA, Justification)
-      - Active Assignments, Eligible Assignments
-      - Access Review Konfiguration
+    Benutzer-Properties:
+      - DisplayName, Vorname, Nachname, UPN, UserType, Konto aktiv, OnPrem-Sync aktiv
+
+    Rollen-Details:
+      - Benutzer, UPN, Rollenname, Zuweisungstyp (Statisch/PIM), Scope, Start-/Enddatum
+      - Unterscheidung: Statische Zuweisung vs. PIM-verwaltete Zuweisung
 
 .PARAMETER OutputFolder
     Ordner fuer die Export-Dateien. Standard: .\EntraID_Export_<Datum>
@@ -35,10 +36,12 @@
 
 .NOTES
     Berechtigungen (Least Privilege / Zero Trust):
-      - Group.Read.All                                    (Gruppen + Members + Owners lesen)
-      - PrivilegedEligibilitySchedule.Read.AzureADGroup   (PIM Eligible Schedules)
-      - PrivilegedAssignmentSchedule.Read.AzureADGroup    (PIM Assignment Schedules)
-      - RoleManagementPolicy.Read.AzureADGroup            (PIM Policy Rules)
+      - Group.Read.All                                    (Gruppen + Members + Owners)
+      - User.Read.All                                     (Alle Benutzerobjekte)
+      - RoleManagement.Read.Directory                     (Directory-Rollenzuweisungen)
+      - PrivilegedEligibilitySchedule.Read.AzureADGroup   (PIM Eligible Schedules Gruppen)
+      - PrivilegedAssignmentSchedule.Read.AzureADGroup    (PIM Assignment Schedules Gruppen)
+      - RoleManagementPolicy.Read.AzureADGroup            (PIM Policy Rules Gruppen)
       - AccessReview.Read.All                             (Access Reviews)
 
     Voraussetzung: Microsoft.Graph PowerShell SDK (Install-Module Microsoft.Graph)
@@ -152,6 +155,8 @@ try {
     $connectParams = @{
         Scopes = @(
             "Group.Read.All",
+            "User.Read.All",
+            "RoleManagement.Read.Directory",
             "PrivilegedEligibilitySchedule.Read.AzureADGroup",
             "PrivilegedAssignmentSchedule.Read.AzureADGroup",
             "RoleManagementPolicy.Read.AzureADGroup",
@@ -195,6 +200,9 @@ $groupOverview    = [System.Collections.Generic.List[PSCustomObject]]::new()
 $memberData       = [System.Collections.Generic.List[PSCustomObject]]::new()
 $pimSettingsData  = [System.Collections.Generic.List[PSCustomObject]]::new()
 $pimAssignData    = [System.Collections.Generic.List[PSCustomObject]]::new()
+$userData         = [System.Collections.Generic.List[PSCustomObject]]::new()
+$rollenAktivData  = [System.Collections.Generic.List[PSCustomObject]]::new()
+$rollenEligData   = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 $totalGroups = $allGroups.Count
 $counter     = 0
@@ -482,13 +490,124 @@ foreach ($group in $allGroups) {
 
 Write-Progress -Activity "Verarbeite Gruppen" -Completed
 
+# ── Alle Benutzer laden ──────────────────────────────────────────────────────
+Write-Log "Lade alle Benutzer aus Entra ID..."
+try {
+    $userUri  = "https://graph.microsoft.com/v1.0/users?`$select=displayName,givenName,surname,userPrincipalName,userType,accountEnabled,onPremisesSyncEnabled&`$top=999"
+    $allUsers = Get-GraphPagedResults -Uri $userUri
+    Write-Log "$($allUsers.Count) Benutzer gefunden." -Level "OK"
+
+    foreach ($u in $allUsers) {
+        $userData.Add([PSCustomObject]@{
+            Anzeigename          = $u.displayName
+            Vorname              = $u.givenName
+            Nachname             = $u.surname
+            UserPrincipalName    = $u.userPrincipalName
+            Benutzertyp          = if ($u.userType) { $u.userType } else { "Member" }
+            Konto_aktiv          = if ($u.accountEnabled) { "Ja" } else { "Nein" }
+            OnPremises_Sync      = if ($u.onPremisesSyncEnabled) { "Ja" } else { "Nein" }
+        })
+    }
+}
+catch {
+    Write-Log "Fehler beim Laden der Benutzer: $_" -Level "ERROR"
+}
+
+# ── Directory-Rollendefinitionen vorladen (ID → Name) ────────────────────────
+Write-Log "Lade Directory-Rollendefinitionen..."
+$roleDefMap = @{}
+try {
+    $roleDefUri  = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?`$select=id,displayName"
+    $roleDefs    = Get-GraphPagedResults -Uri $roleDefUri
+    foreach ($rd in $roleDefs) { $roleDefMap[$rd.id] = $rd.displayName }
+    Write-Log "$($roleDefs.Count) Rollendefinitionen geladen." -Level "OK"
+}
+catch {
+    Write-Log "Fehler beim Laden der Rollendefinitionen: $_" -Level "WARN"
+}
+
+# ── Aktive Directory-Rollenzuweisungen (statisch + PIM-aktiv) ────────────────
+Write-Log "Lade aktive Directory-Rollenzuweisungen..."
+try {
+    # Alle aktiven Zuweisungen laden
+    $assignUri   = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$expand=principal(`$select=displayName,userPrincipalName,id)&`$top=999"
+    $allAssign   = Get-GraphPagedResults -Uri $assignUri
+
+    # PIM-verwaltete aktive Schedules laden (zur Unterscheidung statisch vs. PIM)
+    $schedUri    = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentSchedules?`$select=principalId,roleDefinitionId&`$top=999"
+    $schedules   = Get-GraphPagedResults -Uri $schedUri
+    # Lookup-Set fuer schnellen Vergleich: "principalId|roleDefinitionId"
+    $schedLookup = @{}
+    foreach ($s in $schedules) { $schedLookup["$($s.principalId)|$($s.roleDefinitionId)"] = $true }
+
+    Write-Log "$($allAssign.Count) aktive Rollenzuweisungen gefunden." -Level "OK"
+
+    foreach ($a in $allAssign) {
+        # Nur Benutzer (keine Gruppen oder Service Principals)
+        $principalType = $a.principal.'@odata.type' -replace '#microsoft\.graph\.', ''
+        if ($principalType -ne 'user') { continue }
+
+        $roleName    = if ($roleDefMap[$a.roleDefinitionId]) { $roleDefMap[$a.roleDefinitionId] } else { $a.roleDefinitionId }
+        $isPim       = $schedLookup["$($a.principalId)|$($a.roleDefinitionId)"]
+        $assignType  = if ($isPim) { "PIM (aktiv)" } else { "Statisch (permanent)" }
+        $scope       = if ($a.directoryScopeId -eq "/") { "Tenant (global)" } else { $a.directoryScopeId }
+
+        $rollenAktivData.Add([PSCustomObject]@{
+            Anzeigename          = $a.principal.displayName
+            UPN                  = $a.principal.userPrincipalName
+            Rollenname           = $roleName
+            Zuweisungstyp        = $assignType
+            Scope                = $scope
+        })
+    }
+}
+catch {
+    Write-Log "Fehler beim Laden der aktiven Rollenzuweisungen: $_" -Level "ERROR"
+}
+
+# ── Berechtigte (Eligible) Directory-Rollenzuweisungen via PIM ───────────────
+Write-Log "Lade berechtigte (eligible) Directory-Rollenzuweisungen..."
+try {
+    $eligUri  = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules?`$expand=principal(`$select=displayName,userPrincipalName,id)&`$top=999"
+    $allElig  = Get-GraphPagedResults -Uri $eligUri
+    Write-Log "$($allElig.Count) berechtigte Rollenzuweisungen gefunden." -Level "OK"
+
+    foreach ($e in $allElig) {
+        $principalType = $e.principal.'@odata.type' -replace '#microsoft\.graph\.', ''
+        if ($principalType -ne 'user') { continue }
+
+        $roleName  = if ($roleDefMap[$e.roleDefinitionId]) { $roleDefMap[$e.roleDefinitionId] } else { $e.roleDefinitionId }
+        $scope     = if ($e.directoryScopeId -eq "/") { "Tenant (global)" } else { $e.directoryScopeId }
+        $schedType = if ($e.scheduleInfo.expiration.type -and $e.scheduleInfo.expiration.type -ne 'noExpiration') { "Zeitgebunden" } else { "Permanent" }
+        $startDate = if ($e.scheduleInfo.startDateTime) { $e.scheduleInfo.startDateTime } else { "-" }
+        $endDate   = if ($e.scheduleInfo.expiration.endDateTime) { $e.scheduleInfo.expiration.endDateTime } else { "-" }
+
+        $rollenEligData.Add([PSCustomObject]@{
+            Anzeigename          = $e.principal.displayName
+            UPN                  = $e.principal.userPrincipalName
+            Rollenname           = $roleName
+            Ablauftyp            = $schedType
+            Scope                = $scope
+            Startdatum           = $startDate
+            Enddatum             = $endDate
+            Status               = $e.status
+        })
+    }
+}
+catch {
+    Write-Log "Fehler beim Laden der berechtigten Rollenzuweisungen: $_" -Level "ERROR"
+}
+
 # ── CSV-Export (UTF-8 mit BOM fuer korrekte Sonderzeichen) ───────────────────
 Write-Log "Exportiere CSV-Dateien..."
 
-$fileGroups  = Join-Path $OutputFolder "Gruppen_Uebersicht.csv"
-$fileMembers = Join-Path $OutputFolder "Gruppen_Mitglieder.csv"
-$filePimSet  = Join-Path $OutputFolder "PIM_Einstellungen.csv"
-$filePimAss  = Join-Path $OutputFolder "PIM_Zuweisungen.csv"
+$fileGroups      = Join-Path $OutputFolder "Gruppen_Uebersicht.csv"
+$fileMembers     = Join-Path $OutputFolder "Gruppen_Mitglieder.csv"
+$filePimSet      = Join-Path $OutputFolder "PIM_Einstellungen.csv"
+$filePimAss      = Join-Path $OutputFolder "PIM_Zuweisungen.csv"
+$fileUsers       = Join-Path $OutputFolder "Benutzer.csv"
+$fileRollenAktiv = Join-Path $OutputFolder "Rollen_Aktiv.csv"
+$fileRollenElig  = Join-Path $OutputFolder "Rollen_Eligible.csv"
 
 try {
     if ($groupOverview.Count -gt 0) {
@@ -507,6 +626,18 @@ try {
         Export-CsvUtf8Bom -Data $pimAssignData -Path $filePimAss
         Write-Log "  $filePimAss ($($pimAssignData.Count) Eintraege)" -Level "OK"
     }
+    if ($userData.Count -gt 0) {
+        Export-CsvUtf8Bom -Data $userData -Path $fileUsers
+        Write-Log "  $fileUsers ($($userData.Count) Benutzer)" -Level "OK"
+    }
+    if ($rollenAktivData.Count -gt 0) {
+        Export-CsvUtf8Bom -Data $rollenAktivData -Path $fileRollenAktiv
+        Write-Log "  $fileRollenAktiv ($($rollenAktivData.Count) Eintraege)" -Level "OK"
+    }
+    if ($rollenEligData.Count -gt 0) {
+        Export-CsvUtf8Bom -Data $rollenEligData -Path $fileRollenElig
+        Write-Log "  $fileRollenElig ($($rollenEligData.Count) Eintraege)" -Level "OK"
+    }
     Write-Log "Export abgeschlossen!" -Level "OK"
 }
 catch {
@@ -514,13 +645,19 @@ catch {
 }
 
 # ── Zusammenfassung ──────────────────────────────────────────────────────────
-$pimGroupCount = ($groupOverview | Where-Object { $_.PIM_aktiviert -eq "Ja" }).Count
+$pimGroupCount   = ($groupOverview | Where-Object { $_.PIM_aktiviert -eq "Ja" }).Count
+$staticRoleCount = ($rollenAktivData | Where-Object { $_.Zuweisungstyp -like "Statisch*" }).Count
+$pimRoleCount    = ($rollenAktivData | Where-Object { $_.Zuweisungstyp -like "PIM*" }).Count
 Write-Log "=== Zusammenfassung ===" -Level "OK"
-Write-Log "  Gruppen gesamt     : $($groupOverview.Count)" -Level "OK"
-Write-Log "  PIM-aktiviert      : $pimGroupCount" -Level "OK"
-Write-Log "  Mitgliedschaften   : $($memberData.Count)" -Level "OK"
-Write-Log "  PIM-Zuweisungen    : $($pimAssignData.Count)" -Level "OK"
-Write-Log "  Ausgabeordner      : $OutputFolder" -Level "OK"
+Write-Log "  Gruppen gesamt          : $($groupOverview.Count)" -Level "OK"
+Write-Log "  PIM-Gruppen             : $pimGroupCount" -Level "OK"
+Write-Log "  Gruppen-Mitgliedschaften: $($memberData.Count)" -Level "OK"
+Write-Log "  PIM-Gruppen-Zuweisungen : $($pimAssignData.Count)" -Level "OK"
+Write-Log "  Benutzer gesamt         : $($userData.Count)" -Level "OK"
+Write-Log "  Rollen aktiv (statisch) : $staticRoleCount" -Level "OK"
+Write-Log "  Rollen aktiv (PIM)      : $pimRoleCount" -Level "OK"
+Write-Log "  Rollen eligible (PIM)   : $($rollenEligData.Count)" -Level "OK"
+Write-Log "  Ausgabeordner           : $OutputFolder" -Level "OK"
 
 # ── Verbindung trennen ──────────────────────────────────────────────────────
 Disconnect-MgGraph | Out-Null
