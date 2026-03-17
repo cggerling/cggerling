@@ -652,7 +652,7 @@ if ($runRollen) {
     # Berechtigte (Eligible) Rollenzuweisungen
     Write-Log "Lade berechtigte (eligible) Directory-Rollenzuweisungen..."
     try {
-        $allElig = Get-GraphPagedResults -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules?`$expand=principal(`$select=displayName,userPrincipalName,id)&`$top=999"
+        $allElig = Get-GraphPagedResults -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules?`$expand=principal&`$top=999"
         Write-Log "$($allElig.Count) berechtigte Rollenzuweisungen gefunden." -Level "OK"
 
         foreach ($e in $allElig) {
