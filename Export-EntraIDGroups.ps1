@@ -12,6 +12,8 @@
     [3] PIM fuer Gruppen           -> PIM_Einstellungen.csv, PIM_Zuweisungen.csv
     [4] Benutzer                   -> Benutzer.csv
     [5] Directory-Rollenzuweisungen-> Rollen_Aktiv.csv, Rollen_Eligible.csv
+    [6] Enterprise Apps & App Regs -> Apps_Uebersicht.csv, Apps_Zuweisungen.csv,
+                                      Apps_Provisioning.csv, App_Registrations.csv
     [0] Alle Module exportieren
 
     Berechtigungen werden dynamisch anhand der Auswahl angefordert (Least Privilege).
@@ -163,9 +165,19 @@ $script:moduleDefinitions = @(
         Key    = "Rollen"
         Scopes = @("User.Read.All", "RoleManagement.Read.Directory")
     }
+    [PSCustomObject]@{
+        Id     = 6
+        Name   = "Enterprise Apps & App Regs"
+        Desc   = "Uebersicht, Zuweisungen, SCIM/Provisioning, Credentials"
+        Key    = "Apps"
+        Scopes = @(
+            "Application.Read.All",
+            "Synchronization.Read.All"
+        )
+    }
     # ── Hier weitere Module ergaenzen ──────────────────────────────────────
     # [PSCustomObject]@{
-    #     Id     = 6
+    #     Id     = 7
     #     Name   = "Conditional Access Policies"
     #     Desc   = "Alle CA-Richtlinien mit Zuweisungen"
     #     Key    = "ConditionalAccess"
@@ -255,6 +267,7 @@ $runMitglieder = $selectedKeys -contains "Mitglieder"
 $runPIM        = $selectedKeys -contains "PIM"
 $runBenutzer   = $selectedKeys -contains "Benutzer"
 $runRollen     = $selectedKeys -contains "Rollen"
+$runApps       = $selectedKeys -contains "Apps"
 
 # Gruppen muessen fuer Mitglieder und PIM mitgeladen werden
 $loadGroups    = $runGruppen -or $runMitglieder -or $runPIM
@@ -296,8 +309,12 @@ $memberData      = [System.Collections.Generic.List[PSCustomObject]]::new()
 $pimSettingsData = [System.Collections.Generic.List[PSCustomObject]]::new()
 $pimAssignData   = [System.Collections.Generic.List[PSCustomObject]]::new()
 $userData        = [System.Collections.Generic.List[PSCustomObject]]::new()
-$rollenAktivData = [System.Collections.Generic.List[PSCustomObject]]::new()
-$rollenEligData  = [System.Collections.Generic.List[PSCustomObject]]::new()
+$rollenAktivData       = [System.Collections.Generic.List[PSCustomObject]]::new()
+$rollenEligData        = [System.Collections.Generic.List[PSCustomObject]]::new()
+$entAppsData           = [System.Collections.Generic.List[PSCustomObject]]::new()
+$entAppsZuweisungData  = [System.Collections.Generic.List[PSCustomObject]]::new()
+$entAppsProvisionData  = [System.Collections.Generic.List[PSCustomObject]]::new()
+$appRegsData           = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 #endregion
 
@@ -680,6 +697,186 @@ if ($runRollen) {
 
 #endregion
 
+#region ── Modul: Enterprise Apps & App Registrations ───────────────────────
+
+if ($runApps) {
+
+    # ── Service Principals (Enterprise Apps) laden ───────────────────────────
+    Write-Log "Lade Enterprise Applikationen (Service Principals)..."
+    $allSPs = @()
+    try {
+        # servicePrincipalType 'Application' = echte App-Objekte (keine MSI, keine Legacy)
+        $spUri  = "https://graph.microsoft.com/v1.0/servicePrincipals?`$select=id,appId,displayName,accountEnabled,appRoleAssignmentRequired,publisherName,homepage,replyUrls,tags,servicePrincipalType,appOwnerOrganizationId,appRoles,preferredSingleSignOnMode,loginUrl,notificationEmailAddresses&`$filter=servicePrincipalType eq 'Application'&`$top=999"
+        $allSPs = Get-GraphPagedResults -Uri $spUri
+        Write-Log "$($allSPs.Count) Enterprise Apps gefunden." -Level "OK"
+    }
+    catch {
+        Write-Log "Fehler beim Laden der Enterprise Apps: $_" -Level "ERROR"
+    }
+
+    # Microsoft-Tenant-ID (zur Unterscheidung eigener Apps vs. Microsoft-Apps)
+    $msTenantId  = "f8cdef31-a31e-4b4a-93e4-5f571e91255a"
+    $totalSPs    = $allSPs.Count
+    $spCounter   = 0
+
+    foreach ($sp in $allSPs) {
+        $spCounter++
+        $pct = [math]::Round(($spCounter / $totalSPs) * 100)
+        Write-Progress -Activity "Verarbeite Enterprise Apps" -Status "$spCounter/$totalSPs - $($sp.displayName)" -PercentComplete $pct
+
+        $isMicrosoftApp = ($sp.appOwnerOrganizationId -eq $msTenantId)
+        $spId           = $sp.id
+
+        # ── Provisioning / SCIM Jobs laden (vor Overview, damit Flag gesetzt) ─
+        $provJobs = @()
+        try {
+            $jobsResp = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/synchronization/jobs" -Method GET -ErrorAction Stop
+            if ($jobsResp.value) { $provJobs = $jobsResp.value }
+        }
+        catch { <# Keine Provisioning-Konfiguration oder fehlende Berechtigung #> }
+
+        $hasProvisioning = if ($provJobs.Count -gt 0) { "Ja" } else { "Nein" }
+
+        # ── Enterprise App Uebersicht ────────────────────────────────────────
+        $ssoMode   = if ($sp.preferredSingleSignOnMode) { $sp.preferredSingleSignOnMode } else { "Nicht konfiguriert" }
+        $replyUrls = if ($sp.replyUrls) { $sp.replyUrls -join " | " } else { "" }
+        $tags      = if ($sp.tags) { $sp.tags -join ", " } else { "" }
+
+        $entAppsData.Add([PSCustomObject]@{
+            Name                      = $sp.displayName
+            App_ID                    = $sp.appId
+            Object_ID                 = $spId
+            Publisher                 = $sp.publisherName
+            Konto_aktiviert           = if ($sp.accountEnabled) { "Ja" } else { "Nein" }
+            Zuweisung_erforderlich    = if ($sp.appRoleAssignmentRequired) { "Ja" } else { "Nein" }
+            Sichtbar_fuer_Benutzer    = if ($sp.tags -contains "HideApp") { "Nein" } else { "Ja" }
+            Microsoft_Anwendung       = if ($isMicrosoftApp) { "Ja" } else { "Nein" }
+            SSO_Modus                 = $ssoMode
+            Login_URL                 = $sp.loginUrl
+            Homepage                  = $sp.homepage
+            Reply_URLs                = $replyUrls
+            Provisioning_konfiguriert = $hasProvisioning
+            Tags                      = $tags
+        })
+
+        # ── App Role Assignments (Benutzer/Gruppen zugewiesen) ───────────────
+        try {
+            $assignUri   = "https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/appRoleAssignedTo?`$top=999"
+            $assignments = Get-GraphPagedResults -Uri $assignUri
+            foreach ($a in $assignments) {
+                # Rollennamen aufloesen (Zero-GUID = Standardzugriff)
+                $roleName = "Standardzugriff"
+                if ($a.appRoleId -ne "00000000-0000-0000-0000-000000000000" -and $sp.appRoles) {
+                    $roleObj = $sp.appRoles | Where-Object { $_.id -eq $a.appRoleId }
+                    if ($roleObj) { $roleName = $roleObj.displayName }
+                }
+                $entAppsZuweisungData.Add([PSCustomObject]@{
+                    App_Name       = $sp.displayName
+                    App_ID         = $sp.appId
+                    Principal_Name = $a.principalDisplayName
+                    Principal_Typ  = $a.principalType
+                    Rolle          = $roleName
+                    Zugewiesen_am  = $a.createdDateTime
+                })
+            }
+        }
+        catch { <# Keine Zuweisungen oder fehlende Berechtigung #> }
+
+        # ── Provisioning / SCIM Details ──────────────────────────────────────
+        foreach ($job in $provJobs) {
+            $lastExec = $job.status.lastExecution
+            $lastSucc = $job.status.lastSuccessfulExecution
+
+            # Synchronization Secrets (SCIM Endpoint URL) auslesen
+            $scimEndpoint = ""
+            try {
+                $secretsResp = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/synchronization/secrets" -Method GET -ErrorAction Stop
+                $tenantUrlSecret = $secretsResp.value | Where-Object { $_.key -eq "BaseAddress" }
+                if ($tenantUrlSecret) { $scimEndpoint = $tenantUrlSecret.value }
+            }
+            catch { <# Secrets nicht lesbar #> }
+
+            $entAppsProvisionData.Add([PSCustomObject]@{
+                App_Name                        = $sp.displayName
+                App_ID                          = $sp.appId
+                Job_ID                          = $job.id
+                Template_ID                     = $job.templateId
+                Provisioning_Status             = $job.status.state
+                Schedule_Intervall              = ConvertFrom-IsoDuration -Duration $job.schedule.interval
+                Schedule_Status                 = $job.schedule.state
+                SCIM_Endpoint                   = $scimEndpoint
+                Letzte_Ausfuehrung_Start        = if ($lastExec.timeBegan)  { $lastExec.timeBegan }  else { "-" }
+                Letzte_Ausfuehrung_Ende         = if ($lastExec.timeEnded)  { $lastExec.timeEnded }  else { "-" }
+                Letzte_Ausfuehrung_Status       = if ($lastExec.state)      { $lastExec.state }      else { "-" }
+                Letzte_Erfolgreiche_Ausfuehrung = if ($lastSucc.timeEnded)  { $lastSucc.timeEnded }  else { "-" }
+                Synchronisierte_Objekte         = $job.status.synchronizedEntryCountEntitlement
+                Objekte_In_Quarantaene          = if ($lastExec.countEscrowed) { $lastExec.countEscrowed } else { 0 }
+                Exportierte_Objekte             = if ($lastExec.countExported) { $lastExec.countExported } else { 0 }
+            })
+        }
+    }
+
+    Write-Progress -Activity "Verarbeite Enterprise Apps" -Completed
+
+    # ── App Registrations laden ──────────────────────────────────────────────
+    Write-Log "Lade App Registrations..."
+    try {
+        $appUri  = "https://graph.microsoft.com/v1.0/applications?`$select=id,appId,displayName,publisherDomain,signInAudience,createdDateTime,passwordCredentials,keyCredentials,web,spa,requiredResourceAccess&`$top=999"
+        $allApps = Get-GraphPagedResults -Uri $appUri
+        Write-Log "$($allApps.Count) App Registrations gefunden." -Level "OK"
+
+        foreach ($app in $allApps) {
+
+            # Client Secrets Ablauf pruefen
+            $secretLines = @()
+            foreach ($secret in $app.passwordCredentials) {
+                $daysLeft = if ($secret.endDateTime) {
+                    [int]([datetime]$secret.endDateTime - [datetime]::UtcNow).TotalDays
+                } else { $null }
+                $statusText = if ($null -eq $daysLeft)  { "Kein Ablauf" }
+                              elseif ($daysLeft -lt 0)   { "ABGELAUFEN ($([math]::Abs($daysLeft)) Tage)" }
+                              elseif ($daysLeft -le 30)  { "Laeuft ab in $daysLeft Tagen" }
+                              else                        { "Gueltig ($daysLeft Tage)" }
+                $secretLines += "$($secret.displayName): $statusText"
+            }
+
+            # Zertifikate Ablauf pruefen
+            $certLines = @()
+            foreach ($cert in $app.keyCredentials) {
+                $daysLeft = if ($cert.endDateTime) {
+                    [int]([datetime]$cert.endDateTime - [datetime]::UtcNow).TotalDays
+                } else { $null }
+                $statusText = if ($null -eq $daysLeft)  { "Kein Ablauf" }
+                              elseif ($daysLeft -lt 0)   { "ABGELAUFEN ($([math]::Abs($daysLeft)) Tage)" }
+                              elseif ($daysLeft -le 30)  { "Laeuft ab in $daysLeft Tagen" }
+                              else                        { "Gueltig ($daysLeft Tage)" }
+                $certLines += "$($cert.displayName): $statusText"
+            }
+
+            # Redirect URIs
+            $redirectUris = @()
+            if ($app.web.redirectUris)  { $redirectUris += $app.web.redirectUris }
+            if ($app.spa.redirectUris)  { $redirectUris += $app.spa.redirectUris }
+
+            $appRegsData.Add([PSCustomObject]@{
+                Name              = $app.displayName
+                App_ID            = $app.appId
+                Object_ID         = $app.id
+                Publisher_Domain  = $app.publisherDomain
+                Anmeldegruppe     = $app.signInAudience
+                Erstellt_am       = $app.createdDateTime
+                Client_Secrets    = if ($secretLines) { $secretLines -join " | " } else { "Keine" }
+                Zertifikate       = if ($certLines)   { $certLines   -join " | " } else { "Keine" }
+                Redirect_URIs     = if ($redirectUris) { $redirectUris -join " | " } else { "" }
+                API_Berechtigungen = ($app.requiredResourceAccess.Count)
+            })
+        }
+    }
+    catch { Write-Log "Fehler beim Laden der App Registrations: $_" -Level "ERROR" }
+}
+
+#endregion
+
 #region ── CSV-Export ────────────────────────────────────────────────────────
 
 Write-Log "Exportiere CSV-Dateien (UTF-8 mit BOM)..."
@@ -690,8 +887,12 @@ $exports = @(
     @{ Run = $runPIM;        Data = $pimSettingsData; File = "PIM_Einstellungen.csv";    Label = "PIM-Einstellungen" }
     @{ Run = $runPIM;        Data = $pimAssignData;   File = "PIM_Zuweisungen.csv";      Label = "PIM-Zuweisungen" }
     @{ Run = $runBenutzer;   Data = $userData;        File = "Benutzer.csv";             Label = "Benutzer" }
-    @{ Run = $runRollen;     Data = $rollenAktivData; File = "Rollen_Aktiv.csv";         Label = "Rollen aktiv" }
-    @{ Run = $runRollen;     Data = $rollenEligData;  File = "Rollen_Eligible.csv";      Label = "Rollen eligible" }
+    @{ Run = $runRollen;     Data = $rollenAktivData;      File = "Rollen_Aktiv.csv";           Label = "Rollen aktiv" }
+    @{ Run = $runRollen;     Data = $rollenEligData;       File = "Rollen_Eligible.csv";        Label = "Rollen eligible" }
+    @{ Run = $runApps;       Data = $entAppsData;          File = "Apps_Uebersicht.csv";        Label = "Enterprise Apps" }
+    @{ Run = $runApps;       Data = $entAppsZuweisungData; File = "Apps_Zuweisungen.csv";       Label = "App-Zuweisungen" }
+    @{ Run = $runApps;       Data = $entAppsProvisionData; File = "Apps_Provisioning.csv";      Label = "Provisioning/SCIM" }
+    @{ Run = $runApps;       Data = $appRegsData;          File = "App_Registrations.csv";      Label = "App Registrations" }
 )
 
 foreach ($export in $exports) {
@@ -731,6 +932,15 @@ if ($runRollen) {
     Write-Log "  Rollen aktiv (statisch): $staticCount" -Level "OK"
     Write-Log "  Rollen aktiv (PIM)     : $pimRolCount" -Level "OK"
     Write-Log "  Rollen eligible (PIM)  : $($rollenEligData.Count)" -Level "OK"
+}
+if ($runApps) {
+    $provCount = ($entAppsData | Where-Object { $_.Provisioning_konfiguriert -eq "Ja" }).Count
+    $msAppCount = ($entAppsData | Where-Object { $_.Microsoft_Anwendung -eq "Ja" }).Count
+    Write-Log "  Enterprise Apps gesamt : $($entAppsData.Count)" -Level "OK"
+    Write-Log "    davon Microsoft-Apps : $msAppCount" -Level "OK"
+    Write-Log "    mit Provisioning     : $provCount" -Level "OK"
+    Write-Log "  App-Zuweisungen        : $($entAppsZuweisungData.Count)" -Level "OK"
+    Write-Log "  App Registrations      : $($appRegsData.Count)" -Level "OK"
 }
 Write-Log "  Ausgabeordner         : $OutputFolder" -Level "OK"
 
